@@ -1,6 +1,7 @@
 package peerdiscovery
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -36,6 +37,8 @@ func (d Discovered) String() string {
 // Settings are the settings that can be specified for
 // doing peer discovery.
 type Settings struct {
+	// Context can be used to gracefully terminate peer discovery.
+	Context context.Context
 	// Limit is the number of peers to discover, use < 1 for unlimited.
 	Limit int
 	// Port is the port to broadcast on (the peers must also broadcast using the same port).
@@ -58,8 +61,6 @@ type Settings struct {
 	// unlimited scanning was requested, no timeout.
 	// The default time limit is 10 seconds.
 	TimeLimit time.Duration
-	// StopChan is a channel to stop the peer discvoery immediatley after reception.
-	StopChan chan struct{}
 	// AllowSelf will allow discovery the local machine (default false)
 	AllowSelf bool
 	// DisableBroadcast will not allow sending out a broadcast
@@ -80,7 +81,6 @@ type peerDiscovery struct {
 
 	received map[string][]byte
 	sync.RWMutex
-	exit bool
 }
 
 // initialize returns a new peerDiscovery object which can be used to discover peers.
@@ -95,6 +95,9 @@ func initialize(settings Settings) (p *peerDiscovery, err error) {
 	p.settings = settings
 
 	// defaults
+	if p.settings.Context == nil {
+		p.settings.Context = context.Background()
+	}
 	if p.settings.Port == "" {
 		p.settings.Port = "9999"
 	}
@@ -117,9 +120,6 @@ func initialize(settings Settings) (p *peerDiscovery, err error) {
 	if p.settings.TimeLimit == 0 {
 		p.settings.TimeLimit = 10 * time.Second
 	}
-	if p.settings.StopChan == nil {
-		p.settings.StopChan = make(chan struct{})
-	}
 	p.received = make(map[string][]byte)
 	p.settings.multicastAddressNumbers = net.ParseIP(p.settings.MulticastAddress)
 	if p.settings.multicastAddressNumbers == nil {
@@ -140,6 +140,7 @@ type NetPacketConn interface {
 	SetMulticastTTL(int) error
 	ReadFrom(buf []byte) (int, net.Addr, error)
 	WriteTo(buf []byte, dst net.Addr) (int, error)
+	Close() error
 }
 
 // filterInterfaces returns a list of valid network interfaces
@@ -227,7 +228,13 @@ func Discover(settings ...Settings) (discoveries []Discovered, err error) {
 		p2.JoinGroup(&ifaces[i], &net.UDPAddr{IP: group, Port: portNum})
 	}
 
-	go p.listen()
+	ctx, ctxCancel := context.WithCancel(p.settings.Context)
+	listenErr := make(chan error)
+	go func ()  {
+		_, err := p.listen(ctx)
+		listenErr<- err
+	}()
+
 	ticker := time.NewTicker(tickerDuration)
 	defer ticker.Stop()
 	start := time.Now()
@@ -235,7 +242,7 @@ func Discover(settings ...Settings) (discoveries []Discovered, err error) {
 	for {
 		p.RLock()
 		if len(p.received) >= p.settings.Limit && p.settings.Limit > 0 {
-			p.exit = true
+			ctxCancel()
 		}
 		p.RUnlock()
 
@@ -249,12 +256,11 @@ func Discover(settings ...Settings) (discoveries []Discovered, err error) {
 		}
 
 		select {
-		case <-p.settings.StopChan:
-			p.exit = true
+		case <-ctx.Done():
 		case <-ticker.C:
 		}
 
-		if p.exit || timeLimit > 0 && time.Since(start) > timeLimit {
+		if ctx.Err() != nil || timeLimit > 0 && time.Since(start) > timeLimit {
 			break
 		}
 	}
@@ -279,6 +285,8 @@ func Discover(settings ...Settings) (discoveries []Discovered, err error) {
 		i++
 	}
 	p.RUnlock()
+	ctxCancel()
+	<-listenErr	// wait for listener to finish
 	return
 }
 
@@ -301,7 +309,7 @@ const (
 
 // Listen binds to the UDP address and port given and writes packets received
 // from that address to a buffer which is passed to a hander
-func (p *peerDiscovery) listen() (recievedBytes []byte, err error) {
+func (p *peerDiscovery) listen(ctx context.Context) (recievedBytes []byte, err error) {
 	p.RLock()
 	address := net.JoinHostPort(p.settings.MulticastAddress, p.settings.Port)
 	portNum := p.settings.portNum
@@ -338,6 +346,16 @@ func (p *peerDiscovery) listen() (recievedBytes []byte, err error) {
 	}
 
 	start := time.Now()
+
+	ctx, ctxCancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		<-ctx.Done()
+		p2.Close()	// breaks the forever loop below
+		wg.Done()
+	}()
+
 	// Loop forever reading from the socket
 	for {
 		buffer := make([]byte, maxDatagramSize)
@@ -349,7 +367,7 @@ func (p *peerDiscovery) listen() (recievedBytes []byte, err error) {
 		n, src, errRead = p2.ReadFrom(buffer)
 		if errRead != nil {
 			err = errRead
-			return
+			break
 		}
 
 		srcHost, _, _ := net.SplitHostPort(src.String())
@@ -378,12 +396,14 @@ func (p *peerDiscovery) listen() (recievedBytes []byte, err error) {
 			p.RUnlock()
 			break
 		}
-		if p.exit || timeLimit > 0 && time.Since(start) > timeLimit {
+		if ctx.Err() != nil || timeLimit > 0 && time.Since(start) > timeLimit {
 			p.RUnlock()
 			break
 		}
 		p.RUnlock()
 	}
+	ctxCancel()
+	wg.Wait()
 
 	return
 }
@@ -435,6 +455,11 @@ func (pc4 PacketConn4) WriteTo(buf []byte, dst net.Addr) (int, error) {
 	return pc4.PacketConn.WriteTo(buf, nil, dst)
 }
 
+// Close wraps the ipv4 Close
+func (pc4 PacketConn4) Close() error {
+	return pc4.PacketConn.Close()
+}
+
 type PacketConn6 struct {
 	*ipv6.PacketConn
 }
@@ -453,4 +478,9 @@ func (pc6 PacketConn6) WriteTo(buf []byte, dst net.Addr) (int, error) {
 // SetMulticastTTL wraps the hop limit of ipv6
 func (pc6 PacketConn6) SetMulticastTTL(i int) error {
 	return pc6.SetMulticastHopLimit(i)
+}
+
+// Close wraps the ipv6 Close
+func (pc6 PacketConn6) Close() error {
+	return pc6.PacketConn.Close()
 }
